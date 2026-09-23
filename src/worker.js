@@ -29,8 +29,14 @@ export default {
         return jsonResponse(serviceInfo(request, env));
       }
 
+      // 注意：这三个异步处理函数必须 `return await`，不能只 `return`。
+      // 在 async 函数里 `return promise` 会让 try 块先正常退出，
+      // 之后 promise 才 rejection —— catch 来不及兜，异常直接冒到
+      // Cloudflare 运行时，客户端只会看到一个光秃秃的 `error code: 1101`。
+      // 2026-09-23 实测：UNLIMITED_SURF_API_KEY 未配置时 /v1/chat/completions
+      // 就是 1101，堆栈全丢。
       if (path.startsWith("/api/")) {
-        return proxyUpstream(request, env, path);
+        return await proxyUpstream(request, env, path);
       }
 
       if (path === "/mcp" || path === "/v1/mcp" || path === "/anthropic/mcp" || path === "/anthropic/v1/mcp") {
@@ -46,16 +52,20 @@ export default {
       }
 
       if (path === "/v1/messages" || (path === "/v1/models" && looksLikeAnthropicRequest(request)) || path.startsWith("/anthropic/")) {
-        return handleAnthropic(request, env, path, ctx);
+        return await handleAnthropic(request, env, path, ctx);
       }
 
       if (path.startsWith("/v1/")) {
-        return handleOpenAI(request, env, path, ctx);
+        return await handleOpenAI(request, env, path, ctx);
       }
 
       return errorResponse(404, "not_found", `No route for ${path}`);
     } catch (error) {
-      return errorResponse(500, "internal_error", error && error.message ? error.message : String(error));
+      // 兜底：现在能真正收到上面三个处理函数的异常了。
+      // 把原始信息带给客户端，排障不用再去 tail。
+      const message = (error && error.message) || String(error);
+      const status = /Missing upstream API key/i.test(message) ? 503 : 500;
+      return errorResponse(status, "upstream_error", message);
     }
   },
 };
