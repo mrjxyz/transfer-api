@@ -531,6 +531,41 @@ const CATALOG_FALLBACK_TTL = 60;
 // 对一个只返回几百字节的列表接口来说太久。
 const CATALOG_TIMEOUT_MS = 8000;
 
+/* 上游熔断（状态同样放边缘缓存，各机房自己学）
+ * 光靠缓存时长不够：兜底结果每 60 秒过期一次，每次过期都要再白等一遍
+ * 8 秒超时。上游持续挂的时候，这笔开销会一直重复付。
+ * 这里记连续失败次数，到阈值就直接跳过上游、返回兜底列表 ——
+ * 请求耗时从 8 秒降到 0。冷却期结束自动放一次探测，恢复了就立刻切回。 */
+const CATALOG_BREAKER_KEY = "https://transfer-cache.internal/api/models-breaker";
+const CATALOG_FAIL_THRESHOLD = 3;
+const CATALOG_COOLDOWN_S = 300;
+
+async function readCatalogBreaker(cache) {
+  try {
+    const hit = await cache.match(new Request(CATALOG_BREAKER_KEY, { method: "GET" }));
+    if (!hit) return { failures: 0, openUntil: 0 };
+    return await hit.json();
+  } catch (_) {
+    return { failures: 0, openUntil: 0 };
+  }
+}
+
+function writeCatalogBreaker(cache, ctx, state) {
+  const res = new Response(JSON.stringify(state), {
+    headers: {
+      "content-type": "application/json",
+      "cache-control": `public, max-age=${CATALOG_COOLDOWN_S}`,
+    },
+  });
+  const key = new Request(CATALOG_BREAKER_KEY, { method: "GET" });
+  if (ctx.waitUntil) ctx.waitUntil(cache.put(key, res).catch(() => {}));
+}
+
+function clearCatalogBreaker(cache, ctx) {
+  const key = new Request(CATALOG_BREAKER_KEY, { method: "GET" });
+  if (ctx.waitUntil) ctx.waitUntil(cache.delete(key).catch(() => {}));
+}
+
 async function getModelCatalog(request, env, ctx) {
   if (!ctx) return (await fetchModelCatalog(request, env)) || fallbackModels();
 
@@ -541,7 +576,22 @@ async function getModelCatalog(request, env, ctx) {
     if (hit) return await hit.json();
   } catch (_) { /* 缓存不可用则回源 */ }
 
-  const models = await fetchModelCatalog(request, env);
+  const breaker = await readCatalogBreaker(cache);
+  const tripped = breaker.openUntil > Date.now();
+
+  // 熔断中就别再打上游了，直接兜底
+  const models = tripped ? null : await fetchModelCatalog(request, env);
+
+  if (models) {
+    clearCatalogBreaker(cache, ctx);
+  } else if (!tripped) {
+    const failures = (breaker.failures || 0) + 1;
+    writeCatalogBreaker(cache, ctx, {
+      failures,
+      openUntil: failures >= CATALOG_FAIL_THRESHOLD ? Date.now() + CATALOG_COOLDOWN_S * 1000 : 0,
+    });
+  }
+
   const payload = models || fallbackModels();
   const ttl = models ? CATALOG_TTL : CATALOG_FALLBACK_TTL;
 
