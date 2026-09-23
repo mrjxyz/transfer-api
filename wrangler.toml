@@ -2,19 +2,41 @@ name = "unlimited-transfer-api"
 main = "src/worker.js"
 compatibility_date = "2025-11-21"
 
-# Store the upstream key as a secret instead of committing it here:
+# workers.dev 在本账号被 Cloudflare 账号级限制（host 返回 error 1101，
+# 2026-09-20 用全新 hello-world Worker 也复现），所以对外一律走自定义域名。
+# 等 Cloudflare 恢复该子域后再考虑 workers_dev = true。
+
+routes = [
+  { pattern = "api.mrjxyz.cyou", custom_domain = true }
+]
+
+# 上游密钥存 Secret，不要提交到这里：
 #   wrangler secret put UNLIMITED_SURF_API_KEY
 #
-# Optional: protect this Worker with your own client-facing key:
+# 可选：给这个 Worker 加一层自己的客户端密钥：
 #   wrangler secret put WORKER_API_KEY
-# When WORKER_API_KEY is set, clients must send it as Authorization: Bearer <key>,
-# x-api-key: <key>, or anthropic-api-key: <key>. If it is not set, the Worker
-# keeps the old behavior and accepts any client key.
+# 设了之后客户端必须带 Authorization: Bearer <key> / x-api-key: <key> /
+# anthropic-api-key: <key>。不设则保持旧行为，接受任意客户端密钥。
 #
-# Clients can also send their own key as Authorization: Bearer <key>
-# or x-api-key: <key>; the Worker forwards it upstream when no secret is set.
+# 客户端也可以带自己的密钥（Authorization: Bearer <key> 或 x-api-key: <key>），
+# 在没有 Secret 的情况下 Worker 会把它转发给上游。
 
 [vars]
 UPSTREAM_BASE_URL = "https://unlimited.surf"
 DEFAULT_MODEL = "gateway-gpt-5-5"
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101"
+
+# ---------------------------------------------------------------------------
+# 性能：Smart Placement
+# 上游只有一个（unlimited.surf），是集中式的。Smart Placement 把 Worker 实例
+# 放到离上游更近的机房执行，靠「Worker → 上游」那一跳省时间。SSE 流式场景下
+# 这一跳决定首 token 什么时候到。判定不出更优位置时 Cloudflare 会自动退回
+# 跟着客户端跑，属于只赚不亏的一档。
+# ---------------------------------------------------------------------------
+[placement]
+mode = "smart"
+
+[observability]
+enabled = true
+# 只采样 10%：全量日志会给每次请求加同步开销，10% 够定位问题。
+head_sampling_rate = 0.1

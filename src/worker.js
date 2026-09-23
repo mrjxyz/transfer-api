@@ -7,10 +7,13 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
   "Access-Control-Allow-Headers": "authorization,content-type,x-api-key,anthropic-api-key,anthropic-version,anthropic-beta,openai-beta",
   "Access-Control-Expose-Headers": "content-type,request-id,x-request-id",
+  // 浏览器端客户端（网页里的 Playground / 插件）每次请求前都要发一次预检。
+  // 不声明 Max-Age 等于每次请求都多一个完整往返，缓存 24h 直接省掉。
+  "Access-Control-Max-Age": "86400",
 };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
@@ -43,11 +46,11 @@ export default {
       }
 
       if (path === "/v1/messages" || (path === "/v1/models" && looksLikeAnthropicRequest(request)) || path.startsWith("/anthropic/")) {
-        return handleAnthropic(request, env, path);
+        return handleAnthropic(request, env, path, ctx);
       }
 
       if (path.startsWith("/v1/")) {
-        return handleOpenAI(request, env, path);
+        return handleOpenAI(request, env, path, ctx);
       }
 
       return errorResponse(404, "not_found", `No route for ${path}`);
@@ -57,7 +60,7 @@ export default {
   },
 };
 
-async function handleOpenAI(request, env, path) {
+async function handleOpenAI(request, env, path, ctx) {
   if ((path === "/v1/key" || path === "/v1/auth-key" || path === "/v1/usage") && request.method === "GET") {
     const rawPath = path === "/v1/usage" ? "/api/usage" : "/api/key";
     return proxyUpstream(request, env, rawPath);
@@ -65,9 +68,9 @@ async function handleOpenAI(request, env, path) {
 
   if (path === "/v1/models" && request.method === "GET") {
     if (looksLikeAnthropicRequest(request)) {
-      return anthropicModels(request, env);
+      return anthropicModels(request, env, ctx);
     }
-    return openAIModels(request, env);
+    return openAIModels(request, env, ctx);
   }
 
   if (path === "/v1/search" && request.method === "POST") {
@@ -225,7 +228,7 @@ async function openAIResponses(request, env, body) {
   });
 }
 
-async function handleAnthropic(request, env, path) {
+async function handleAnthropic(request, env, path, ctx) {
   const anthPath = path.startsWith("/anthropic/") ? normalizePath(path.slice("/anthropic".length) || "/") : path;
 
   if ((anthPath === "/v1/key" || anthPath === "/key" || anthPath === "/v1/auth-key" || anthPath === "/auth-key") && request.method === "GET") {
@@ -237,7 +240,7 @@ async function handleAnthropic(request, env, path) {
   }
 
   if ((anthPath === "/v1/models" || anthPath === "/models") && request.method === "GET") {
-    return anthropicModels(request, env);
+    return anthropicModels(request, env, ctx);
   }
 
   if ((anthPath === "/v1/messages" || anthPath === "/messages") && request.method === "POST") {
@@ -309,8 +312,8 @@ async function anthropicMessages(request, env, body) {
   });
 }
 
-async function openAIModels(request, env) {
-  const catalog = await getModelCatalog(request, env);
+async function openAIModels(request, env, ctx) {
+  const catalog = await getModelCatalog(request, env, ctx);
   return jsonResponse({
     object: "list",
     data: catalog.map((model) => ({
@@ -325,8 +328,8 @@ async function openAIModels(request, env) {
   });
 }
 
-async function anthropicModels(request, env) {
-  const catalog = await getModelCatalog(request, env);
+async function anthropicModels(request, env, ctx) {
+  const catalog = await getModelCatalog(request, env, ctx);
   const claudeModels = catalog
     .filter((model) => /claude|anthropic/i.test(`${model.id} ${model.name || ""} ${model.provider || ""}`))
     .map((model) => toAnthropicModel(model));
@@ -501,7 +504,38 @@ async function collectUnlimitedText(request, env, path, payload) {
   return { text, finishReason, annotations, rawEvents: events };
 }
 
-async function getModelCatalog(request, env) {
+/* 模型目录的边缘缓存
+ * 每个客户端启动都会 GET /v1/models，原来每次都打一次上游 /api/models。
+ * 这个列表是静态的，缓存 5 分钟即可 —— 省掉的是「客户端首屏」那一次往返。
+ * 只缓存上游成功返回的结果；上游挂了就走 fallbackModels()，不被缓存污染。 */
+const CATALOG_TTL = 300;
+
+async function getModelCatalog(request, env, ctx) {
+  if (ctx) {
+    const cache = caches.default;
+    const cacheKey = new Request("https://transfer-cache.internal/api/models", { method: "GET" });
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) return await hit.json();
+    } catch (_) { /* 缓存不可用则回源 */ }
+
+    const models = await fetchModelCatalog(request, env);
+    if (!models) return fallbackModels();
+
+    const res = new Response(JSON.stringify(models), {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": `public, max-age=${CATALOG_TTL}, s-maxage=${CATALOG_TTL}`,
+      },
+    });
+    if (ctx.waitUntil) ctx.waitUntil(cache.put(cacheKey, res.clone()).catch(() => {}));
+    return models;
+  }
+  return (await fetchModelCatalog(request, env)) || fallbackModels();
+}
+
+/** 真正打上游；失败返回 null（由调用方决定回退策略） */
+async function fetchModelCatalog(request, env) {
   try {
     const headers = new Headers();
     const key = optionalUpstreamApiKey(request, env);
@@ -517,7 +551,7 @@ async function getModelCatalog(request, env) {
       tier: model.tier || undefined,
     })).filter((model) => model.id);
   } catch (_) {
-    return fallbackModels();
+    return null;
   }
 }
 
@@ -752,14 +786,17 @@ function sseResponse(body) {
       ...CORS_HEADERS,
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
-      "Connection": "keep-alive",
+      // X-Accel-Buffering 是给 nginx 看的；这里保留是防止以后有人在这条链路前面
+      // 再挂一层反向代理时缓冲住 SSE。
       "X-Accel-Buffering": "no",
     },
   });
 }
 
 function jsonResponse(data, init = {}) {
-  return new Response(JSON.stringify(data, null, 2), {
+  // 不再 pretty-print：模型目录有几百条，缩进后体积能翻 3~5 倍，
+  // 序列化本身也吃 CPU。API 客户端只解析，不给人看，压缩输出。
+  return new Response(JSON.stringify(data), {
     ...init,
     headers: {
       ...CORS_HEADERS,
