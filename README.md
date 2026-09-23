@@ -112,6 +112,19 @@ curl https://<your-worker>.workers.dev/v1/setup \
 
 ## 本地 Wrangler 手动部署
 
+> 不想跟 node / npm / wrangler 的安装纠缠的话，直接跑仓库里的 `cf-secret.sh`：
+>
+> ```bash
+> ./cf-secret.sh                        # 默认写 UNLIMITED_SURF_API_KEY（交互式输入，不回显）
+> ./cf-secret.sh WORKER_API_KEY         # 写别的 secret
+> ./cf-secret.sh WORKER_API_KEY --delete
+> NAME=别的worker名 ./cf-secret.sh       # 指定 Worker
+> ```
+>
+> 脚本自己会：找 node（PATH 优先，找不到就退到 WorkBuddy 自带的）、
+> 用项目本地的 `node_modules/.bin/wrangler`（不联网下载）、
+> 按 `$CF_ENV_FILE` → `./.env` → 已知的巡检目录顺序载入 `CLOUDFLARE_API_TOKEN`。
+
 也可以在本地直接部署：
 
 ```powershell
