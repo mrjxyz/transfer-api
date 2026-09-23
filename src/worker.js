@@ -506,32 +506,43 @@ async function collectUnlimitedText(request, env, path, payload) {
 
 /* 模型目录的边缘缓存
  * 每个客户端启动都会 GET /v1/models，原来每次都打一次上游 /api/models。
- * 这个列表是静态的，缓存 5 分钟即可 —— 省掉的是「客户端首屏」那一次往返。
- * 只缓存上游成功返回的结果；上游挂了就走 fallbackModels()，不被缓存污染。 */
+ * 这个列表是静态的，缓存即可 —— 省掉的是「客户端首屏」那一次往返。
+ *
+ * 两种情况分开对待：
+ *  - 上游成功 → 缓存 5 分钟
+ *  - 上游失败 → 兜底列表只缓 60 秒
+ * 后者是实测逼出来的：2026-09-23 上游 /api/models 返回 522、要等 21 秒才超时，
+ * 如果失败结果不入缓存，每个客户端启动都要白等一次 21 秒。
+ * 缓 60 秒既避开这个坑，又保证上游一恢复就能在 1 分钟内切回真实列表。
+ */
 const CATALOG_TTL = 300;
+const CATALOG_FALLBACK_TTL = 60;
+// 上游超时上限。不给的话要等 fetch 的默认超时（~21 秒）才回落，
+// 对一个只返回几百字节的列表接口来说太久。
+const CATALOG_TIMEOUT_MS = 8000;
 
 async function getModelCatalog(request, env, ctx) {
-  if (ctx) {
-    const cache = caches.default;
-    const cacheKey = new Request("https://transfer-cache.internal/api/models", { method: "GET" });
-    try {
-      const hit = await cache.match(cacheKey);
-      if (hit) return await hit.json();
-    } catch (_) { /* 缓存不可用则回源 */ }
+  if (!ctx) return (await fetchModelCatalog(request, env)) || fallbackModels();
 
-    const models = await fetchModelCatalog(request, env);
-    if (!models) return fallbackModels();
+  const cache = caches.default;
+  const cacheKey = new Request("https://transfer-cache.internal/api/models", { method: "GET" });
+  try {
+    const hit = await cache.match(cacheKey);
+    if (hit) return await hit.json();
+  } catch (_) { /* 缓存不可用则回源 */ }
 
-    const res = new Response(JSON.stringify(models), {
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": `public, max-age=${CATALOG_TTL}, s-maxage=${CATALOG_TTL}`,
-      },
-    });
-    if (ctx.waitUntil) ctx.waitUntil(cache.put(cacheKey, res.clone()).catch(() => {}));
-    return models;
-  }
-  return (await fetchModelCatalog(request, env)) || fallbackModels();
+  const models = await fetchModelCatalog(request, env);
+  const payload = models || fallbackModels();
+  const ttl = models ? CATALOG_TTL : CATALOG_FALLBACK_TTL;
+
+  const res = new Response(JSON.stringify(payload), {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": `public, max-age=${ttl}, s-maxage=${ttl}`,
+    },
+  });
+  if (ctx.waitUntil) ctx.waitUntil(cache.put(cacheKey, res.clone()).catch(() => {}));
+  return payload;
 }
 
 /** 真正打上游；失败返回 null（由调用方决定回退策略） */
@@ -540,7 +551,10 @@ async function fetchModelCatalog(request, env) {
     const headers = new Headers();
     const key = optionalUpstreamApiKey(request, env);
     if (key) headers.set("Authorization", `Bearer ${key}`);
-    const response = await fetch(new URL("/api/models", upstreamBase(env)), { headers });
+    const response = await fetch(new URL("/api/models", upstreamBase(env)), {
+      headers,
+      signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
+    });
     if (!response.ok) throw new Error(`models failed: ${response.status}`);
     const data = await response.json();
     const models = Array.isArray(data) ? data : Array.isArray(data.data) ? data.data : [];
